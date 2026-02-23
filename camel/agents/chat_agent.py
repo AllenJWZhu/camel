@@ -462,7 +462,14 @@ class ChatAgent(BaseAgent):
             context window that can be occupied by summary information. Used
             to limit how much of the model's context is reserved for
             summarization results. (default: :obj:`0.6`)
+        enable_sub_agent_tool (bool, optional): Whether to expose a built-in
+            `delegate_to_sub_agent` tool that lets the current agent delegate
+            a task to an ephemeral child ChatAgent with an isolated memory.
+            The child can only use a caller-provided subset of this agent's
+            internal tools. (default: :obj:`False`)
     """
+
+    SUB_AGENT_TOOL_NAME = "delegate_to_sub_agent"
 
     def __init__(
         self,
@@ -509,6 +516,7 @@ class ChatAgent(BaseAgent):
         step_timeout: Optional[float] = Constants.TIMEOUT_THRESHOLD,
         stream_accumulate: Optional[bool] = None,
         summary_window_ratio: float = 0.6,
+        enable_sub_agent_tool: bool = False,
     ) -> None:
         if isinstance(model, ModelManager):
             self.model_backend = model
@@ -591,6 +599,16 @@ class ChatAgent(BaseAgent):
                 convert_to_function_tool(tool) for tool in (tools or [])
             ]
         }
+        self.enable_sub_agent_tool = enable_sub_agent_tool
+        if self.enable_sub_agent_tool:
+            if self.SUB_AGENT_TOOL_NAME in self._internal_tools:
+                logger.warning(
+                    "Sub-agent delegation tool '%s' was not added because "
+                    "a tool with the same name already exists.",
+                    self.SUB_AGENT_TOOL_NAME,
+                )
+            else:
+                self.add_tool(self.delegate_to_sub_agent)
 
         # Register agent with toolkits that have RegisteredAgentToolkit mixin
         if toolkits_to_register_agent:
@@ -1213,6 +1231,186 @@ class ChatAgent(BaseAgent):
         r"""Add a list of tools to the agent."""
         for tool in tools:
             self.add_tool(tool)
+
+    def _normalize_sub_agent_tool_names(
+        self, tool_names: List[str]
+    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        if not isinstance(tool_names, list) or not tool_names:
+            return (
+                None,
+                "Sub-agent delegation failed: `tool_names` is required and "
+                "must contain at least one tool name.",
+            )
+
+        normalized_names: List[str] = []
+        for raw_name in tool_names:
+            if not isinstance(raw_name, str):
+                return (
+                    None,
+                    "Sub-agent delegation failed: every tool name in "
+                    "`tool_names` must be a string.",
+                )
+            cleaned_name = raw_name.strip()
+            if not cleaned_name:
+                return (
+                    None,
+                    "Sub-agent delegation failed: every tool name in "
+                    "`tool_names` must be a non-empty string.",
+                )
+            if cleaned_name not in normalized_names:
+                normalized_names.append(cleaned_name)
+
+        if not normalized_names:
+            return (
+                None,
+                "Sub-agent delegation failed: `tool_names` is required and "
+                "must contain at least one tool name.",
+            )
+
+        return normalized_names, None
+
+    def _create_sub_agent_for_delegation(
+        self, tool_names: List[str]
+    ) -> "ChatAgent":
+        cloned_tools, toolkits_to_register = self._clone_tools()
+        cloned_tool_map = {
+            tool.get_function_name(): tool for tool in cloned_tools
+        }
+
+        selected_tools: List[FunctionTool] = []
+        for tool_name in tool_names:
+            selected_tool = cloned_tool_map.get(tool_name)
+            if selected_tool is None:
+                original_tool = self._internal_tools[tool_name]
+                selected_tool = FunctionTool(
+                    func=original_tool.func,
+                    openai_tool_schema=original_tool.get_openai_tool_schema(),
+                )
+            selected_tools.append(selected_tool)
+
+        return ChatAgent(
+            # Use the original system message source; passing the already
+            # language-augmented system message plus output_language would
+            # append the language instruction twice.
+            system_message=self._original_system_message,
+            model=self.model_backend.models,
+            memory=None,
+            message_window_size=getattr(self.memory, "window_size", None),
+            summarize_threshold=self.summarize_threshold,
+            token_limit=getattr(
+                self.memory.get_context_creator(), "token_limit", None
+            ),
+            output_language=self._output_language,
+            tools=cast(List[Union[FunctionTool, Callable]], selected_tools),
+            toolkits_to_register_agent=toolkits_to_register,
+            scheduling_strategy=self.model_backend.scheduling_strategy.__name__,
+            max_iteration=self.max_iteration,
+            agent_id=f"{self.agent_id}_sub_agent_{uuid.uuid4().hex[:8]}",
+            stop_event=self.stop_event,
+            tool_execution_timeout=self.tool_execution_timeout,
+            mask_tool_output=self.mask_tool_output,
+            pause_event=self.pause_event,
+            prune_tool_calls_from_memory=self.prune_tool_calls_from_memory,
+            enable_snapshot_clean=self._enable_snapshot_clean,
+            retry_attempts=self.retry_attempts,
+            retry_delay=self.retry_delay,
+            step_timeout=self.step_timeout,
+            stream_accumulate=self.stream_accumulate,
+            summary_window_ratio=self.summary_window_ratio,
+            enable_sub_agent_tool=False,
+        )
+
+    def delegate_to_sub_agent(self, task: str, tool_names: list[str]) -> str:
+        r"""Delegate a task to an isolated child ChatAgent.
+
+        The child inherits this agent's current system prompt and model
+        configuration, but runs with a fresh memory and only the tools listed
+        in `tool_names`.
+
+        Args:
+            task (str): The task to delegate to the child agent.
+            tool_names (list[str]): Required list of tool names to expose to
+                the child agent. Must be a subset of this agent's tools.
+
+        Returns:
+            str: The child agent's final response content, or a non-throwing
+                failure message when delegation cannot be completed.
+        """
+        if not isinstance(task, str) or not task.strip():
+            return (
+                "Sub-agent delegation failed: `task` must be a non-empty "
+                "string."
+            )
+
+        normalized_tool_names, normalize_error = (
+            self._normalize_sub_agent_tool_names(tool_names)
+        )
+        if normalize_error is not None:
+            return normalize_error
+        assert normalized_tool_names is not None
+
+        if self.SUB_AGENT_TOOL_NAME in normalized_tool_names:
+            return (
+                "Sub-agent delegation failed: recursive sub-agent delegation "
+                "is not allowed."
+            )
+
+        missing_tools = [
+            name
+            for name in normalized_tool_names
+            if name not in self._internal_tools
+        ]
+        if missing_tools:
+            available_tools = ", ".join(sorted(self._internal_tools.keys()))
+            return (
+                "Sub-agent delegation failed: requested tool(s) not found: "
+                f"{missing_tools}. Available tools: [{available_tools}]"
+            )
+
+        try:
+            sub_agent = self._create_sub_agent_for_delegation(
+                normalized_tool_names
+            )
+            sub_agent_response = sub_agent.step(task.strip())
+        except Exception as exc:
+            return f"Sub-agent delegation failed: {exc!s}"
+
+        if not sub_agent_response.msgs:
+            termination_reasons = (
+                sub_agent_response.info.get("termination_reasons")
+                if isinstance(sub_agent_response.info, dict)
+                else None
+            )
+            if termination_reasons:
+                return (
+                    "Sub-agent delegation failed: no output messages "
+                    f"(termination_reasons={termination_reasons})."
+                )
+            return "Sub-agent delegation failed: no output messages."
+
+        if sub_agent_response.msg is not None:
+            final_content = sub_agent_response.msg.content or ""
+        else:
+            final_content = "\n".join(
+                msg.content
+                for msg in sub_agent_response.msgs
+                if getattr(msg, "content", None)
+            ).strip()
+
+        if final_content:
+            return final_content
+
+        termination_reasons = (
+            sub_agent_response.info.get("termination_reasons")
+            if isinstance(sub_agent_response.info, dict)
+            else None
+        )
+        if termination_reasons:
+            return (
+                "Sub-agent delegation failed: empty response content "
+                f"(termination_reasons={termination_reasons})."
+            )
+        return "Sub-agent delegation failed: empty response content."
 
     def _serialize_tool_result(self, result: Any) -> str:
         if isinstance(result, str):
@@ -5945,6 +6143,7 @@ class ChatAgent(BaseAgent):
             pause_event=self.pause_event,
             prune_tool_calls_from_memory=self.prune_tool_calls_from_memory,
             stream_accumulate=self.stream_accumulate,
+            enable_sub_agent_tool=self.enable_sub_agent_tool,
         )
 
         # Copy memory if requested

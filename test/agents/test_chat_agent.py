@@ -45,6 +45,7 @@ from camel.models import (
     ModelFactory,
     OpenAIModel,
 )
+from camel.responses import ChatAgentResponse
 from camel.terminators import ResponseWordsTerminator
 from camel.toolkits import (
     FunctionTool,
@@ -213,6 +214,173 @@ def test_clean_snapshot_in_memory_skips_missing_records():
     records_after = storage.load()
     assert records_after == records_before
     assert entry.cached is True
+
+
+def test_chat_agent_enable_sub_agent_tool_registration():
+    model = DummyModel(ModelType.GPT_4O_MINI)
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        enable_sub_agent_tool=True,
+    )
+
+    assert ChatAgent.SUB_AGENT_TOOL_NAME in assistant.tool_dict
+
+
+def test_delegate_to_sub_agent_requires_tool_names_and_blocks_recursion():
+    model = DummyModel(ModelType.GPT_4O_MINI)
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_sub_agent_tool=True,
+    )
+
+    no_tools_result = assistant.delegate_to_sub_agent(
+        task="Compute 1 + 2",
+        tool_names=[],
+    )
+    assert "`tool_names` is required" in no_tools_result
+
+    missing_tools_result = assistant.delegate_to_sub_agent(
+        task="Compute 1 + 2",
+        tool_names=["does_not_exist"],
+    )
+    assert "requested tool(s) not found" in missing_tools_result
+
+    recursive_result = assistant.delegate_to_sub_agent(
+        task="Compute 1 + 2",
+        tool_names=[ChatAgent.SUB_AGENT_TOOL_NAME],
+    )
+    assert "recursive sub-agent delegation is not allowed" in recursive_result
+
+
+def test_delegate_to_sub_agent_non_throwing_on_runtime_failure(monkeypatch):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_sub_agent_tool=True,
+    )
+
+    def _raise_error(_tool_names: List[str]):
+        raise RuntimeError("mock child failure")
+
+    monkeypatch.setattr(
+        assistant, "_create_sub_agent_for_delegation", _raise_error
+    )
+
+    result = assistant.delegate_to_sub_agent(
+        task="Compute 1 + 2",
+        tool_names=["local_add"],
+    )
+    assert "Sub-agent delegation failed: mock child failure" == result
+
+
+def test_delegate_to_sub_agent_returns_child_result(monkeypatch):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_sub_agent_tool=True,
+    )
+
+    captured: dict = {}
+
+    class FakeSubAgent:
+        def __init__(self):
+            self.task = None
+
+        def step(self, task: str):
+            self.task = task
+            return ChatAgentResponse(
+                msgs=[
+                    BaseMessage.make_assistant_message(
+                        role_name="assistant",
+                        content="delegated result",
+                    )
+                ],
+                terminated=False,
+                info={},
+            )
+
+    fake_sub_agent = FakeSubAgent()
+
+    def _create_fake_sub_agent(tool_names: List[str]):
+        captured["tool_names"] = tool_names
+        return fake_sub_agent
+
+    monkeypatch.setattr(
+        assistant, "_create_sub_agent_for_delegation", _create_fake_sub_agent
+    )
+
+    result = assistant.delegate_to_sub_agent(
+        task="   Compute 1 + 2   ",
+        tool_names=["local_add"],
+    )
+
+    assert captured["tool_names"] == ["local_add"]
+    assert fake_sub_agent.task == "Compute 1 + 2"
+    assert result == "delegated result"
+
+
+def test_sub_agent_inherits_system_prompt_and_disables_recursion():
+    model = DummyModel(ModelType.GPT_4O_MINI)
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are the parent agent.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_sub_agent_tool=True,
+        output_language="English",
+    )
+
+    child = assistant._create_sub_agent_for_delegation(["local_add"])
+    assert child.system_message is not None
+    assert assistant.system_message is not None
+    assert child.system_message.content == assistant.system_message.content
+    assert ChatAgent.SUB_AGENT_TOOL_NAME not in child.tool_dict
 
 
 @pytest.mark.model_backend
