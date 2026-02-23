@@ -66,6 +66,7 @@ from camel.agents._utils import (
     safe_model_dump,
 )
 from camel.agents.base import BaseAgent
+from camel.agents.subagents import SubAgentRegistry, SubAgentSpec
 from camel.logger import get_logger
 from camel.memories import (
     AgentMemory,
@@ -467,9 +468,17 @@ class ChatAgent(BaseAgent):
             a task to an ephemeral child ChatAgent with an isolated memory.
             The child can only use a caller-provided subset of this agent's
             internal tools. (default: :obj:`False`)
+        enable_named_sub_agent_tools (bool, optional): Whether to load
+            markdown-defined sub-agent specs and expose one delegation tool per
+            sub-agent name. (default: :obj:`False`)
+        sub_agent_spec_paths (Optional[List[Union[str, Path]]], optional):
+            Optional search roots for sub-agent specs. When not provided,
+            defaults to `.camel/agents` in the current working directory and
+            `~/.camel/agents`. (default: :obj:`None`)
     """
 
     SUB_AGENT_TOOL_NAME = "delegate_to_sub_agent"
+    LIST_SUB_AGENTS_TOOL_NAME = "list_sub_agents"
 
     def __init__(
         self,
@@ -517,6 +526,8 @@ class ChatAgent(BaseAgent):
         stream_accumulate: Optional[bool] = None,
         summary_window_ratio: float = 0.6,
         enable_sub_agent_tool: bool = False,
+        enable_named_sub_agent_tools: bool = False,
+        sub_agent_spec_paths: Optional[List[Union[str, Path]]] = None,
     ) -> None:
         if isinstance(model, ModelManager):
             self.model_backend = model
@@ -599,6 +610,12 @@ class ChatAgent(BaseAgent):
                 convert_to_function_tool(tool) for tool in (tools or [])
             ]
         }
+        self.enable_named_sub_agent_tools = enable_named_sub_agent_tools
+        self._sub_agent_spec_paths = sub_agent_spec_paths
+        self._named_sub_agent_specs: Dict[str, SubAgentSpec] = {}
+        self._named_sub_agent_tool_names: Set[str] = set()
+        self._current_step_sub_agent_calls: List[Dict[str, Any]] = []
+
         self.enable_sub_agent_tool = enable_sub_agent_tool
         if self.enable_sub_agent_tool:
             if self.SUB_AGENT_TOOL_NAME in self._internal_tools:
@@ -609,6 +626,9 @@ class ChatAgent(BaseAgent):
                 )
             else:
                 self.add_tool(self.delegate_to_sub_agent)
+
+        if self.enable_named_sub_agent_tools:
+            self._register_named_sub_agent_tools()
 
         # Register agent with toolkits that have RegisteredAgentToolkit mixin
         if toolkits_to_register_agent:
@@ -1232,6 +1252,140 @@ class ChatAgent(BaseAgent):
         for tool in tools:
             self.add_tool(tool)
 
+    def _register_named_sub_agent_tools(self) -> None:
+        r"""Load markdown sub-agent specs and register delegation tools."""
+        registry = SubAgentRegistry(
+            search_paths=self._sub_agent_spec_paths,
+            working_directory=Path.cwd(),
+        )
+        loaded_specs = registry.list_specs()
+        self._named_sub_agent_specs = {}
+        self._named_sub_agent_tool_names = set()
+
+        if self.LIST_SUB_AGENTS_TOOL_NAME in self._internal_tools:
+            logger.warning(
+                "Named sub-agent listing tool '%s' was not added because a "
+                "tool with the same name already exists.",
+                self.LIST_SUB_AGENTS_TOOL_NAME,
+            )
+        else:
+            self.add_tool(self.list_sub_agents)
+
+        for name, spec in loaded_specs.items():
+            if name in self._internal_tools:
+                logger.warning(
+                    "Named sub-agent tool '%s' was not added because a tool "
+                    "with the same name already exists.",
+                    name,
+                )
+                continue
+            self.add_tool(self._build_named_sub_agent_tool(spec))
+            self._named_sub_agent_specs[name] = spec
+            self._named_sub_agent_tool_names.add(name)
+
+    def _build_named_sub_agent_tool(self, spec: SubAgentSpec) -> FunctionTool:
+        tool_name = spec.name
+
+        def _named_sub_agent_delegate(task: str, tool_names: list[str]) -> str:
+            r"""Delegate a task to this configured sub-agent.
+
+            Args:
+                task (str): The task to delegate.
+                tool_names (list[str]): Required subset of parent tools to
+                    expose to this sub-agent invocation.
+            """
+            return self.delegate_to_named_sub_agent(
+                sub_agent_name=tool_name,
+                task=task,
+                tool_names=tool_names,
+            )
+
+        openai_tool_schema = {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": spec.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": (
+                                "The concrete task to delegate to this "
+                                "sub-agent."
+                            ),
+                        },
+                        "tool_names": {
+                            "type": "array",
+                            "description": (
+                                "Required subset of parent tool names to "
+                                "expose to this sub-agent call."
+                            ),
+                            "items": {
+                                "type": "string",
+                                "description": "A parent tool name.",
+                            },
+                        },
+                    },
+                    "required": ["task", "tool_names"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+        return FunctionTool(
+            func=_named_sub_agent_delegate,
+            openai_tool_schema=openai_tool_schema,
+        )
+
+    def list_sub_agents(self) -> str:
+        r"""List markdown-defined named sub-agents available to this agent."""
+        if not self._named_sub_agent_specs:
+            return "No named sub-agents are currently available."
+
+        lines = ["Available named sub-agents:"]
+        for name in sorted(self._named_sub_agent_specs.keys()):
+            spec = self._named_sub_agent_specs[name]
+            if spec.allowed_tools is None:
+                allowed_tools_text = "any parent tool subset"
+            elif not spec.allowed_tools:
+                allowed_tools_text = "no tools allowed by spec"
+            else:
+                allowed_tools_text = ", ".join(spec.allowed_tools)
+            lines.append(
+                f"- {name}: {spec.description} "
+                f"(spec tools: {allowed_tools_text})"
+            )
+        return "\n".join(lines)
+
+    def _is_delegation_tool_name(self, tool_name: str) -> bool:
+        return (
+            tool_name == self.SUB_AGENT_TOOL_NAME
+            or tool_name in self._named_sub_agent_tool_names
+        )
+
+    def _record_sub_agent_call(
+        self,
+        *,
+        tool_name: str,
+        task: str,
+        tool_names: List[str],
+        status: str,
+        sub_agent_name: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "tool_name": tool_name,
+            "task": task,
+            "tool_names": tool_names,
+            "status": status,
+        }
+        if sub_agent_name is not None:
+            entry["sub_agent_name"] = sub_agent_name
+        if error is not None:
+            entry["error"] = error
+        self._current_step_sub_agent_calls.append(entry)
+
     def _normalize_sub_agent_tool_names(
         self, tool_names: List[str]
     ) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -1270,7 +1424,9 @@ class ChatAgent(BaseAgent):
         return normalized_names, None
 
     def _create_sub_agent_for_delegation(
-        self, tool_names: List[str]
+        self,
+        tool_names: List[str],
+        system_message: Optional[BaseMessage] = None,
     ) -> "ChatAgent":
         cloned_tools, toolkits_to_register = self._clone_tools()
         cloned_tool_map = {
@@ -1289,10 +1445,10 @@ class ChatAgent(BaseAgent):
             selected_tools.append(selected_tool)
 
         return ChatAgent(
-            # Use the original system message source; passing the already
-            # language-augmented system message plus output_language would
-            # append the language instruction twice.
-            system_message=self._original_system_message,
+            # Use the original system message source by default; passing the
+            # already language-augmented system message plus output_language
+            # would append the language instruction twice.
+            system_message=system_message or self._original_system_message,
             model=self.model_backend.models,
             memory=None,
             message_window_size=getattr(self.memory, "window_size", None),
@@ -1318,7 +1474,223 @@ class ChatAgent(BaseAgent):
             stream_accumulate=self.stream_accumulate,
             summary_window_ratio=self.summary_window_ratio,
             enable_sub_agent_tool=False,
+            enable_named_sub_agent_tools=False,
         )
+
+    def _validate_sub_agent_request(
+        self, task: str, tool_names: list[str]
+    ) -> Tuple[Optional[str], Optional[List[str]]]:
+        if not isinstance(task, str) or not task.strip():
+            return (
+                "Sub-agent delegation failed: `task` must be a non-empty "
+                "string.",
+                None,
+            )
+
+        normalized_tool_names, normalize_error = (
+            self._normalize_sub_agent_tool_names(tool_names)
+        )
+        if normalize_error is not None:
+            return normalize_error, None
+        assert normalized_tool_names is not None
+
+        recursive_tool_names = [
+            name
+            for name in normalized_tool_names
+            if self._is_delegation_tool_name(name)
+        ]
+        if recursive_tool_names:
+            return (
+                "Sub-agent delegation failed: recursive sub-agent delegation "
+                f"is not allowed (requested: {recursive_tool_names}).",
+                None,
+            )
+
+        missing_tools = [
+            name
+            for name in normalized_tool_names
+            if name not in self._internal_tools
+        ]
+        if missing_tools:
+            available_tools = ", ".join(sorted(self._internal_tools.keys()))
+            return (
+                "Sub-agent delegation failed: requested tool(s) not found: "
+                f"{missing_tools}. Available tools: [{available_tools}]",
+                None,
+            )
+
+        return None, normalized_tool_names
+
+    def _run_sub_agent_and_extract_result(
+        self,
+        *,
+        task: str,
+        normalized_tool_names: List[str],
+        system_message: Optional[BaseMessage],
+    ) -> Tuple[bool, str]:
+        try:
+            if system_message is None:
+                sub_agent = self._create_sub_agent_for_delegation(
+                    normalized_tool_names
+                )
+            else:
+                sub_agent = self._create_sub_agent_for_delegation(
+                    normalized_tool_names,
+                    system_message,
+                )
+            sub_agent_response = sub_agent.step(task.strip())
+        except Exception as exc:
+            return False, f"Sub-agent delegation failed: {exc!s}"
+
+        if not sub_agent_response.msgs:
+            termination_reasons = (
+                sub_agent_response.info.get("termination_reasons")
+                if isinstance(sub_agent_response.info, dict)
+                else None
+            )
+            if termination_reasons:
+                return (
+                    False,
+                    "Sub-agent delegation failed: no output messages "
+                    f"(termination_reasons={termination_reasons}).",
+                )
+            return False, "Sub-agent delegation failed: no output messages."
+
+        if sub_agent_response.msg is not None:
+            final_content = sub_agent_response.msg.content or ""
+        else:
+            final_content = "\n".join(
+                msg.content
+                for msg in sub_agent_response.msgs
+                if getattr(msg, "content", None)
+            ).strip()
+
+        if final_content:
+            return True, final_content
+
+        termination_reasons = (
+            sub_agent_response.info.get("termination_reasons")
+            if isinstance(sub_agent_response.info, dict)
+            else None
+        )
+        if termination_reasons:
+            return (
+                False,
+                "Sub-agent delegation failed: empty response content "
+                f"(termination_reasons={termination_reasons}).",
+            )
+        return False, "Sub-agent delegation failed: empty response content."
+
+    def _delegate_with_spec(
+        self,
+        *,
+        delegation_tool_name: str,
+        sub_agent_name: Optional[str],
+        task: str,
+        tool_names: list[str],
+        system_message: Optional[BaseMessage] = None,
+    ) -> str:
+        validation_error, normalized_tool_names = (
+            self._validate_sub_agent_request(task, tool_names)
+        )
+        if validation_error is not None:
+            self._record_sub_agent_call(
+                tool_name=delegation_tool_name,
+                sub_agent_name=sub_agent_name,
+                task=task,
+                tool_names=[],
+                status="failed",
+                error=validation_error,
+            )
+            return validation_error
+        assert normalized_tool_names is not None
+
+        ok, result_text = self._run_sub_agent_and_extract_result(
+            task=task,
+            normalized_tool_names=normalized_tool_names,
+            system_message=system_message,
+        )
+        self._record_sub_agent_call(
+            tool_name=delegation_tool_name,
+            sub_agent_name=sub_agent_name,
+            task=task.strip(),
+            tool_names=normalized_tool_names,
+            status="succeeded" if ok else "failed",
+            error=None if ok else result_text,
+        )
+        return result_text
+
+    def delegate_to_named_sub_agent(
+        self, sub_agent_name: str, task: str, tool_names: list[str]
+    ) -> str:
+        r"""Delegate to a configured markdown sub-agent by name."""
+        spec = self._named_sub_agent_specs.get(sub_agent_name)
+        if spec is None:
+            error_message = (
+                "Sub-agent delegation failed: unknown sub-agent "
+                f"'{sub_agent_name}'."
+            )
+            self._record_sub_agent_call(
+                tool_name=sub_agent_name,
+                sub_agent_name=sub_agent_name,
+                task=task,
+                tool_names=[],
+                status="failed",
+                error=error_message,
+            )
+            return error_message
+
+        validation_error, normalized_tool_names = (
+            self._validate_sub_agent_request(task, tool_names)
+        )
+        if validation_error is not None:
+            self._record_sub_agent_call(
+                tool_name=sub_agent_name,
+                sub_agent_name=sub_agent_name,
+                task=task,
+                tool_names=[],
+                status="failed",
+                error=validation_error,
+            )
+            return validation_error
+        assert normalized_tool_names is not None
+
+        if spec.allowed_tools is not None:
+            disallowed_tools = [
+                name
+                for name in normalized_tool_names
+                if name not in spec.allowed_tools
+            ]
+            if disallowed_tools:
+                error_message = (
+                    "Sub-agent delegation failed: requested tool(s) are not "
+                    f"allowed by sub-agent spec '{sub_agent_name}': "
+                    f"{disallowed_tools}. Spec allows: {spec.allowed_tools}"
+                )
+                self._record_sub_agent_call(
+                    tool_name=sub_agent_name,
+                    sub_agent_name=sub_agent_name,
+                    task=task,
+                    tool_names=normalized_tool_names,
+                    status="failed",
+                    error=error_message,
+                )
+                return error_message
+
+        ok, result_text = self._run_sub_agent_and_extract_result(
+            task=task,
+            normalized_tool_names=normalized_tool_names,
+            system_message=BaseMessage.make_system_message(spec.system_prompt),
+        )
+        self._record_sub_agent_call(
+            tool_name=sub_agent_name,
+            sub_agent_name=sub_agent_name,
+            task=task.strip(),
+            tool_names=normalized_tool_names,
+            status="succeeded" if ok else "failed",
+            error=None if ok else result_text,
+        )
+        return result_text
 
     def delegate_to_sub_agent(self, task: str, tool_names: list[str]) -> str:
         r"""Delegate a task to an isolated child ChatAgent.
@@ -1336,81 +1708,12 @@ class ChatAgent(BaseAgent):
             str: The child agent's final response content, or a non-throwing
                 failure message when delegation cannot be completed.
         """
-        if not isinstance(task, str) or not task.strip():
-            return (
-                "Sub-agent delegation failed: `task` must be a non-empty "
-                "string."
-            )
-
-        normalized_tool_names, normalize_error = (
-            self._normalize_sub_agent_tool_names(tool_names)
+        return self._delegate_with_spec(
+            delegation_tool_name=self.SUB_AGENT_TOOL_NAME,
+            sub_agent_name=None,
+            task=task,
+            tool_names=tool_names,
         )
-        if normalize_error is not None:
-            return normalize_error
-        assert normalized_tool_names is not None
-
-        if self.SUB_AGENT_TOOL_NAME in normalized_tool_names:
-            return (
-                "Sub-agent delegation failed: recursive sub-agent delegation "
-                "is not allowed."
-            )
-
-        missing_tools = [
-            name
-            for name in normalized_tool_names
-            if name not in self._internal_tools
-        ]
-        if missing_tools:
-            available_tools = ", ".join(sorted(self._internal_tools.keys()))
-            return (
-                "Sub-agent delegation failed: requested tool(s) not found: "
-                f"{missing_tools}. Available tools: [{available_tools}]"
-            )
-
-        try:
-            sub_agent = self._create_sub_agent_for_delegation(
-                normalized_tool_names
-            )
-            sub_agent_response = sub_agent.step(task.strip())
-        except Exception as exc:
-            return f"Sub-agent delegation failed: {exc!s}"
-
-        if not sub_agent_response.msgs:
-            termination_reasons = (
-                sub_agent_response.info.get("termination_reasons")
-                if isinstance(sub_agent_response.info, dict)
-                else None
-            )
-            if termination_reasons:
-                return (
-                    "Sub-agent delegation failed: no output messages "
-                    f"(termination_reasons={termination_reasons})."
-                )
-            return "Sub-agent delegation failed: no output messages."
-
-        if sub_agent_response.msg is not None:
-            final_content = sub_agent_response.msg.content or ""
-        else:
-            final_content = "\n".join(
-                msg.content
-                for msg in sub_agent_response.msgs
-                if getattr(msg, "content", None)
-            ).strip()
-
-        if final_content:
-            return final_content
-
-        termination_reasons = (
-            sub_agent_response.info.get("termination_reasons")
-            if isinstance(sub_agent_response.info, dict)
-            else None
-        )
-        if termination_reasons:
-            return (
-                "Sub-agent delegation failed: empty response content "
-                f"(termination_reasons={termination_reasons})."
-            )
-        return "Sub-agent delegation failed: empty response content."
 
     def _serialize_tool_result(self, result: Any) -> str:
         if isinstance(result, str):
@@ -3102,6 +3405,8 @@ class ChatAgent(BaseAgent):
                 role_name="User", content=input_message
             )
 
+        self._current_step_sub_agent_calls = []
+
         # Add user input to memory
         self.update_memory(input_message, OpenAIBackendRole.USER)
 
@@ -3403,6 +3708,8 @@ class ChatAgent(BaseAgent):
             input_message = BaseMessage.make_user_message(
                 role_name="User", content=input_message
             )
+
+        self._current_step_sub_agent_calls = []
 
         self.update_memory(input_message, OpenAIBackendRole.USER)
 
@@ -3993,7 +4300,7 @@ class ChatAgent(BaseAgent):
         if self.terminated and termination_reason is not None:
             finish_reasons = [termination_reason] * len(finish_reasons)
 
-        return get_info_dict(
+        info = get_info_dict(
             response_id,
             usage_dict,
             finish_reasons,
@@ -4001,6 +4308,8 @@ class ChatAgent(BaseAgent):
             tool_calls,
             external_tool_call_requests,
         )
+        info["sub_agent_calls"] = self._current_step_sub_agent_calls.copy()
+        return info
 
     def _handle_batch_response(
         self, response: ChatCompletion
@@ -4110,6 +4419,7 @@ class ChatAgent(BaseAgent):
             num_tokens,
             tool_calls,
         )
+        info["sub_agent_calls"] = self._current_step_sub_agent_calls.copy()
 
         return ChatAgentResponse(
             msgs=[],
@@ -4410,6 +4720,8 @@ class ChatAgent(BaseAgent):
                 role_name="User", content=input_message
             )
 
+        self._current_step_sub_agent_calls = []
+
         # Add user input to memory
         self.update_memory(input_message, OpenAIBackendRole.USER)
 
@@ -4639,6 +4951,7 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
                             },
                         )
                         yield final_response
@@ -4847,6 +5160,7 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
                             },
                         )
                         yield final_response
@@ -5363,6 +5677,7 @@ class ChatAgent(BaseAgent):
                 "error": error_message,
                 "tool_calls": tool_call_records,
                 "streaming": True,
+                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
             },
         )
 
@@ -5378,6 +5693,8 @@ class ChatAgent(BaseAgent):
             input_message = BaseMessage.make_user_message(
                 role_name="User", content=input_message
             )
+
+        self._current_step_sub_agent_calls = []
 
         # Add user input to memory
         self.update_memory(input_message, OpenAIBackendRole.USER)
@@ -5598,6 +5915,7 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
                             },
                         )
                         yield final_response
@@ -5906,6 +6224,7 @@ class ChatAgent(BaseAgent):
                                 "external_tool_requests": None,
                                 "streaming": False,
                                 "partial": False,
+                                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
                             },
                         )
                         yield final_response
@@ -6058,6 +6377,7 @@ class ChatAgent(BaseAgent):
                 "external_tool_requests": None,
                 "streaming": True,
                 "partial": True,
+                "sub_agent_calls": self._current_step_sub_agent_calls.copy(),
             },
         )
 
@@ -6144,6 +6464,8 @@ class ChatAgent(BaseAgent):
             prune_tool_calls_from_memory=self.prune_tool_calls_from_memory,
             stream_accumulate=self.stream_accumulate,
             enable_sub_agent_tool=self.enable_sub_agent_tool,
+            enable_named_sub_agent_tools=self.enable_named_sub_agent_tools,
+            sub_agent_spec_paths=self._sub_agent_spec_paths,
         )
 
         # Copy memory if requested
@@ -6176,6 +6498,15 @@ class ChatAgent(BaseAgent):
         # Cache for cloned toolkits by original toolkit id
 
         for tool in self._internal_tools.values():
+            tool_name = tool.get_function_name()
+            if (
+                self._is_delegation_tool_name(tool_name)
+                or tool_name == self.LIST_SUB_AGENTS_TOOL_NAME
+            ):
+                # Delegation tools must be rebound to the new agent instance
+                # during __init__, so skip cloning these bound methods.
+                continue
+
             # Check if this tool is a method bound to a toolkit instance
             if hasattr(tool.func, '__self__'):
                 toolkit_instance = tool.func.__self__

@@ -383,6 +383,244 @@ def test_sub_agent_inherits_system_prompt_and_disables_recursion():
     assert ChatAgent.SUB_AGENT_TOOL_NAME not in child.tool_dict
 
 
+def test_chat_agent_registers_named_sub_agent_tools(tmp_path):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+    specs_dir = tmp_path / ".camel" / "agents"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    (specs_dir / "research_agent.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: research_agent",
+                "description: Researches focused topics.",
+                "tools:",
+                "  - local_add",
+                "---",
+                "You are a dedicated research sub-agent.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_named_sub_agent_tools=True,
+        sub_agent_spec_paths=[specs_dir],
+    )
+
+    assert "research_agent" in assistant.tool_dict
+    assert ChatAgent.LIST_SUB_AGENTS_TOOL_NAME in assistant.tool_dict
+    listing = assistant.list_sub_agents()
+    assert "research_agent" in listing
+
+
+def test_named_sub_agent_enforces_spec_tool_subset(tmp_path):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+    specs_dir = tmp_path / ".camel" / "agents"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    (specs_dir / "research_agent.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: research_agent",
+                "description: Researches focused topics.",
+                "tools:",
+                "  - local_add",
+                "---",
+                "You are a dedicated research sub-agent.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    def local_mul(a: int, b: int) -> int:
+        r"""Multiply two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a * b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add), FunctionTool(local_mul)],
+        enable_named_sub_agent_tools=True,
+        sub_agent_spec_paths=[specs_dir],
+    )
+
+    result = assistant.delegate_to_named_sub_agent(
+        sub_agent_name="research_agent",
+        task="Compute 2 * 3",
+        tool_names=["local_mul"],
+    )
+    assert "not allowed by sub-agent spec 'research_agent'" in result
+
+
+def test_named_sub_agent_registry_priority_first_path_wins(tmp_path):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+    repo_specs_dir = tmp_path / "repo_specs"
+    user_specs_dir = tmp_path / "user_specs"
+    repo_specs_dir.mkdir(parents=True, exist_ok=True)
+    user_specs_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_specs_dir.joinpath("research_agent.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: research_agent",
+                "description: Repo scoped description.",
+                "tools:",
+                "  - local_add",
+                "---",
+                "You are repo scoped prompt.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    user_specs_dir.joinpath("research_agent.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: research_agent",
+                "description: User scoped description.",
+                "tools:",
+                "  - local_add",
+                "---",
+                "You are user scoped prompt.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are a helpful assistant.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_named_sub_agent_tools=True,
+        sub_agent_spec_paths=[repo_specs_dir, user_specs_dir],
+    )
+
+    listing = assistant.list_sub_agents()
+    assert "Repo scoped description." in listing
+    assert "User scoped description." not in listing
+
+
+def test_named_sub_agent_uses_dedicated_prompt_and_blocks_recursion(
+    monkeypatch, tmp_path
+):
+    model = DummyModel(ModelType.GPT_4O_MINI)
+    specs_dir = tmp_path / ".camel" / "agents"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    sub_prompt = "You are a dedicated research sub-agent."
+    (specs_dir / "research_agent.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: research_agent",
+                "description: Researches focused topics.",
+                "tools:",
+                "  - local_add",
+                "---",
+                sub_prompt,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def local_add(a: int, b: int) -> int:
+        r"""Add two integers.
+
+        Args:
+            a (int): The first integer.
+            b (int): The second integer.
+        """
+        return a + b
+
+    assistant = ChatAgent(
+        system_message="You are the parent agent.",
+        model=model,
+        tools=[FunctionTool(local_add)],
+        enable_sub_agent_tool=True,
+        enable_named_sub_agent_tools=True,
+        sub_agent_spec_paths=[specs_dir],
+    )
+
+    recursive_result = assistant.delegate_to_sub_agent(
+        task="Use a named sub-agent",
+        tool_names=["research_agent"],
+    )
+    assert "recursive sub-agent delegation is not allowed" in recursive_result
+
+    captured: dict = {}
+
+    class FakeSubAgent:
+        def step(self, task: str):
+            captured["task"] = task
+            return ChatAgentResponse(
+                msgs=[
+                    BaseMessage.make_assistant_message(
+                        role_name="assistant",
+                        content="research done",
+                    )
+                ],
+                terminated=False,
+                info={},
+            )
+
+    def _create_fake_sub_agent(
+        tool_names: List[str], system_message: BaseMessage | None = None
+    ):
+        captured["tool_names"] = tool_names
+        captured["system_prompt"] = (
+            system_message.content if system_message is not None else None
+        )
+        return FakeSubAgent()
+
+    monkeypatch.setattr(
+        assistant, "_create_sub_agent_for_delegation", _create_fake_sub_agent
+    )
+
+    result = assistant.tool_dict["research_agent"](
+        task="Investigate dependency graph",
+        tool_names=["local_add"],
+    )
+    assert result == "research done"
+    assert captured["task"] == "Investigate dependency graph"
+    assert captured["tool_names"] == ["local_add"]
+    assert captured["system_prompt"] == sub_prompt
+
+
 @pytest.mark.model_backend
 def test_chat_agent_stored_messages():
     system_msg = BaseMessage(
